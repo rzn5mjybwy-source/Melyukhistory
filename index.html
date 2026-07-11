@@ -608,8 +608,10 @@ async function fetchAppData(key, fallback){
 }
 async function saveAppData(key, value){
   try{
-    await sb.from("app_data").upsert({ key, value, updated_at: new Date().toISOString() });
-  } catch(e){ console.error("Ошибка сохранения:", e); }
+    const { error } = await sb.from("app_data").upsert({ key, value, updated_at: new Date().toISOString() });
+    if(error){ console.error("Ошибка сохранения:", error); return false; }
+    return true;
+  } catch(e){ console.error("Ошибка сохранения:", e); return false; }
 }
 async function loadProfileForCurrentSession(){
   const { data: { session } } = await sb.auth.getSession();
@@ -948,12 +950,16 @@ function handleAvatarUpload(input){
     const dataUrl = e.target.result;
     if(currentProfile){
       currentProfile.avatar_url = dataUrl;
-      await sb.from("profiles").update({ avatar_url: dataUrl }).eq("id", currentProfile.id);
+      document.querySelectorAll(".js-profile-avatar-slot").forEach(slot => {
+        slot.innerHTML = `<img class="profile-avatar" src="${dataUrl}" alt="${esc(user)}">`;
+      });
+      const { error } = await sb.from("profiles").update({ avatar_url: dataUrl }).eq("id", currentProfile.id);
+      if(error){
+        alert("Фото не сохранилось на сервере — проверь подключение или права доступа. В этом браузере оно видно временно.");
+        return;
+      }
       await refreshProfilesCache();
     }
-    document.querySelectorAll(".js-profile-avatar-slot").forEach(slot => {
-      slot.innerHTML = `<img class="profile-avatar" src="${dataUrl}" alt="${esc(user)}">`;
-    });
   };
   reader.readAsDataURL(file);
 }
@@ -1308,12 +1314,12 @@ function renderRoleBadge(p){
 function findProfileByNickname(nick){
   nick = (nick || "").trim().toLowerCase();
   if(!nick) return null;
-  return (sharedDataCache.profiles || []).find(p => p.nickname.toLowerCase() === nick) || null;
+  return (sharedDataCache.profiles || []).find(p => p.nickname && p.nickname.toLowerCase() === nick) || null;
 }
 
 /* ---- persisted edits to novels (title/cover/author/tags/chapters), overlaid onto NOVELS on load ---- */
 function loadNovelOverrides(){ return sharedDataCache.novelOverrides || {}; }
-function saveNovelOverrides(o){ sharedDataCache.novelOverrides = o; saveAppData("novelOverrides", o); }
+async function saveNovelOverrides(o){ sharedDataCache.novelOverrides = o; return await saveAppData("novelOverrides", o); }
 function applyNovelOverrides(){
   const overrides = loadNovelOverrides();
   NOVELS.forEach(n => {
@@ -1332,10 +1338,10 @@ function applyNovelOverrides(){
     }
   });
 }
-function patchNovelOverride(novelId, patch){
+async function patchNovelOverride(novelId, patch){
   const overrides = loadNovelOverrides();
   overrides[novelId] = Object.assign({}, overrides[novelId] || {}, patch);
-  saveNovelOverrides(overrides);
+  return await saveNovelOverrides(overrides);
 }
 /* ---------------- ROLE / PERMISSION MANAGEMENT (requires can_promote_admins) ---------------- */
 async function handleAdminUpdatePermissions(e){
@@ -1344,7 +1350,7 @@ async function handleAdminUpdatePermissions(e){
   const nick = document.getElementById("permNick").value.trim();
   const status = document.getElementById("permStatus");
   if(!nick){ if(status) status.textContent = "Введите никнейм"; return false; }
-  const target = sharedDataCache.profiles.find(p => p.nickname.toLowerCase() === nick.toLowerCase());
+  const target = sharedDataCache.profiles.find(p => p.nickname && p.nickname.toLowerCase() === nick.toLowerCase());
   if(!target){ if(status) status.textContent = "Пользователь с таким ником не найден"; return false; }
   const patch = {
     is_admin: document.getElementById("permIsAdmin").checked,
@@ -1364,7 +1370,7 @@ async function handleAdminUpdatePermissions(e){
   return false;
 }
 function fillPermFormFromNickname(nick){
-  const target = sharedDataCache.profiles.find(p => p.nickname.toLowerCase() === (nick||"").trim().toLowerCase());
+  const target = sharedDataCache.profiles.find(p => p.nickname && p.nickname.toLowerCase() === (nick||"").trim().toLowerCase());
   if(!target) return;
   document.getElementById("permIsAdmin").checked = !!target.is_admin;
   document.getElementById("permEditTitles").checked = !!target.can_edit_titles;
@@ -1483,7 +1489,7 @@ async function handleAdminDeleteNovel(novelId){
   router();
 }
 
-function handleAdminSaveInfo(novelId){
+async function handleAdminSaveInfo(novelId){
   if(!hasPermission('can_edit_titles')) return;
   const n = NOVELS.find(x => x.id === novelId);
   if(!n) return;
@@ -1498,9 +1504,14 @@ function handleAdminSaveInfo(novelId){
   if(!title || !author){ return; }
   const patch = { title, author, tags, desc, mature };
   n.title = title; n.author = author; n.tags = tags; n.desc = desc; n.mature = mature;
-  patchNovelOverride(novelId, patch);
   const status = document.getElementById(`admStatus-${novelId}`);
-  if(status){ status.textContent = "Сохранено"; setTimeout(() => status.textContent = "", 2000); }
+  if(status){ status.textContent = "Сохраняю…"; status.style.color = ""; }
+  const ok = await patchNovelOverride(novelId, patch);
+  if(status){
+    status.textContent = ok ? "Сохранено ✓" : "Не сохранилось — проверь подключение или права доступа";
+    status.style.color = ok ? "" : "#e0223c";
+    setTimeout(() => { status.textContent = ""; status.style.color = ""; }, ok ? 2000 : 5000);
+  }
   // keep any open lists (home page leaderboard/catalog) in sync if visible
   router();
 }
@@ -1510,17 +1521,18 @@ function handleAdminCoverUpload(input, novelId){
   const file = input.files[0];
   if(!file.type.startsWith("image/")) return;
   const reader = new FileReader();
-  reader.onload = function(e){
+  reader.onload = async function(e){
     const dataUrl = e.target.result;
     const n = NOVELS.find(x => x.id === novelId);
     if(n) n.cover = dataUrl;
-    patchNovelOverride(novelId, { cover: dataUrl });
     const preview = document.getElementById(`admCoverPreview-${novelId}`);
     if(preview) preview.src = dataUrl;
+    const ok = await patchNovelOverride(novelId, { cover: dataUrl });
+    if(!ok) alert("Обложка не сохранилась на сервере — проверь подключение или права доступа. В этом браузере она видна временно.");
   };
   reader.readAsDataURL(file);
 }
-function handleAdminAddChapter(novelId){
+async function handleAdminAddChapter(novelId){
   if(!hasPermission('can_edit_chapters')) return;
   const n = NOVELS.find(x => x.id === novelId);
   if(!n) return;
@@ -1541,13 +1553,18 @@ function handleAdminAddChapter(novelId){
   if(existingIdx >= 0){ n.toc[existingIdx] = { n: num, t: title, locked: false }; }
   else { n.toc.push({ n: num, t: title, locked: false }); }
 
-  patchNovelOverride(novelId, { toc: n.toc, chapters: n.chapters });
-  if(isNewChapter){
+  const status = document.getElementById(`admChStatus-${novelId}`);
+  if(status){ status.textContent = "Сохраняю…"; status.style.color = ""; }
+  const ok = await patchNovelOverride(novelId, { toc: n.toc, chapters: n.chapters });
+  if(ok && isNewChapter){
     pushNotification({ type: "chapter", novelId, title: `Новая глава: ${n.title} — глава ${num}`, message: title });
   }
   numInput.value = ""; titleInput.value = ""; textInput.value = "";
-  const status = document.getElementById(`admChStatus-${novelId}`);
-  if(status){ status.textContent = `Глава ${esc(num)} сохранена`; setTimeout(() => status.textContent = "", 2500); }
+  if(status){
+    status.textContent = ok ? `Глава ${esc(num)} сохранена ✓` : "Не сохранилось — проверь подключение или права доступа";
+    status.style.color = ok ? "" : "#e0223c";
+    setTimeout(() => { status.textContent = ""; status.style.color = ""; }, ok ? 2500 : 5000);
+  }
   const chList = document.getElementById(`admChList-${novelId}`);
   if(chList) chList.innerHTML = renderAdminChapterList(n);
 }
@@ -1574,7 +1591,7 @@ function handleAdminEditChapter(novelId, num){
   if(textInput) textInput.value = ch.paragraphs.join("\n\n");
   if(textInput) textInput.scrollIntoView({behavior:"smooth", block:"center"});
 }
-function handleAdminDeleteChapter(novelId, num){
+async function handleAdminDeleteChapter(novelId, num){
   if(!hasPermission('can_edit_chapters')) return;
   const n = NOVELS.find(x => x.id === novelId);
   if(!n) return;
@@ -1583,7 +1600,8 @@ function handleAdminDeleteChapter(novelId, num){
   if(n.toc) n.toc = n.toc.filter(c => c.n !== num);
   const overrides = loadNovelOverrides();
   const prevDeleted = (overrides[novelId] && overrides[novelId].deletedChapters) || [];
-  patchNovelOverride(novelId, { toc: n.toc, chapters: n.chapters, deletedChapters: [...new Set([...prevDeleted, num])] });
+  const ok = await patchNovelOverride(novelId, { toc: n.toc, chapters: n.chapters, deletedChapters: [...new Set([...prevDeleted, num])] });
+  if(!ok) alert("Удаление не сохранилось на сервере — проверь подключение или права доступа.");
   const chList = document.getElementById(`admChList-${novelId}`);
   if(chList) chList.innerHTML = renderAdminChapterList(n);
   router();
@@ -1831,7 +1849,7 @@ function renderUserSearchResults(q){
   const box = document.getElementById("userSearchResults");
   if(!box) return;
   if(!q){ box.style.display = "none"; box.innerHTML = ""; return; }
-  const matches = (sharedDataCache.profiles || []).filter(p => p.nickname.toLowerCase().includes(q)).slice(0, 6);
+  const matches = (sharedDataCache.profiles || []).filter(p => p.nickname && p.nickname.toLowerCase().includes(q)).slice(0, 6);
   if(!matches.length){ box.style.display = "none"; box.innerHTML = ""; return; }
   box.style.display = "flex";
   box.innerHTML = `<span class="user-search-label">Читатели:</span>` +
@@ -1843,7 +1861,7 @@ function handleSearchKey(e){
   if(!q) return;
   const novelMatch = NOVELS.find(n => n.title.toLowerCase().includes(q));
   if(novelMatch){ location.hash = "#/novel/" + novelMatch.id; return; }
-  const userMatch = (sharedDataCache.profiles || []).find(p => p.nickname.toLowerCase().includes(q));
+  const userMatch = (sharedDataCache.profiles || []).find(p => p.nickname && p.nickname.toLowerCase().includes(q));
   if(userMatch){ location.hash = "#/user/" + encodeURIComponent(userMatch.nickname); }
 }
 
@@ -1957,7 +1975,7 @@ function renderCard(n){
       <div class="card-badge">${esc(n.kind)}</div>
       <div class="card-rating" data-novel-id="${n.id}">${n.rating > 0 ? n.rating.toFixed(1) : '—'}</div>
       <img src="${n.cover}" alt="${esc(n.title)}" loading="lazy"
-        onerror="this.remove(); this.parentNode.insertAdjacentHTML('beforeend', '<div class=&quot;veil-label&quot;>Открой,<br>чтобы узнать больше</div>');">
+        onerror="this.insertAdjacentHTML('afterend', '<div class=&quot;veil-label&quot;>Открой,<br>чтобы узнать больше</div>'); this.remove();">
       ${n.mature ? `<span class="mature-tag cover-mature-tag">21+</span>` : ``}
     </div>
     <div class="card-body">
